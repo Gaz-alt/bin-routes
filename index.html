@@ -57,6 +57,15 @@
   #btnTravel { background: var(--purple); }
   #btnTravel.on { background: var(--green); }
   #btnFinish { background: var(--ink); }
+  #btnPause { background: #8a6d1f; }
+  #btnPause.on { background: var(--green); }
+  #banner.pause { background: #8a6d1f; }
+  .pin { font-weight: 800; font-size: 12px; color: #fff; border-radius: 6px; padding: 2px 6px;
+         white-space: nowrap; border: 2px solid #fff; box-shadow: 0 1px 4px rgba(0,0,0,.4); }
+  .pin.pause { background: #8a6d1f; }
+  .pin.resume { background: #1a9c3c; }
+  #wakeStat.ok b { color: var(--green); }
+  #wakeStat.bad b { color: var(--red); }
   .secondary { background: #e7eaf0; color: var(--ink); }
   #done { display: none; padding: 12px; background: #fff; border-top: 1px solid #dde1e7; }
   #done.show { display: block; }
@@ -79,6 +88,8 @@
   <span>Reverses <b id="tRev">0</b></span>
   <span>Travel <b id="tTravel">0.0 km</b></span>
   <span id="gapStat" hidden>Not recorded <b id="tGap">0</b></span>
+  <span id="tipStat" hidden>Tip runs <b id="tTip">0</b></span>
+  <span id="wakeStat" hidden><b id="tWake"></b></span>
 </div>
 <div id="map"></div>
 <div id="banner">Tap START at the depot</div>
@@ -86,6 +97,7 @@
   <button id="btnStart">START</button>
   <button id="btnTravel" disabled>TRAVEL</button>
   <button id="btnReverse" disabled>REVERSE</button>
+  <button id="btnPause" hidden>PAUSE</button>
   <button id="btnFinish" disabled>FINISH</button>
 </div>
 <div id="done">
@@ -114,9 +126,13 @@ const STORE_KEY = DEMO ? "roundRecorder.demo" : "roundRecorder.v1";  // practice
 // ---------------------------------------------------------------------------
 // State (saved to the tablet as we go, so a reload or crash loses nothing)
 // ---------------------------------------------------------------------------
-let state = { name: "", started: null, finished: null, reversing: false, travelling: false, points: [] };
-// point: [lat, lon, time_ms, mode, accuracy_m, gapBefore?]
+const blankState = () => ({ name: "", started: null, finished: null, reversing: false, travelling: false,
+                            paused: false, resumeNext: false, endedPaused: false, points: [] });
+let state = blankState();
+// point: [lat, lon, time_ms, mode, accuracy_m, break?]
 // mode: 0 = collecting (green), 1 = reversing (red), 2 = travelling to next area (purple)
+// break (the line doesn't join to the point before): 1 = not recorded (page hidden /
+// GPS lost), 2 = resumed after PAUSE (tip run)
 const COLOURS = ["#1a9c3c", "#d62b2b", "#7c3aed"];
 const modeNow = () => state.reversing ? 1 : state.travelling ? 2 : 0;
 
@@ -137,9 +153,24 @@ const me = L.circleMarker([0, 0], { radius: 9, color: "#fff", weight: 3, fillCol
 let follow = true;
 map.on("dragstart", () => { follow = false; });
 
+const pinIcon = (html, cls) => L.divIcon({ className: "", iconSize: null, iconAnchor: [0, 12],
+  html: `<div class="pin ${cls}">${html}</div>` });
+
 function redraw() {
   routeLayer.clearLayers();
   const rs = runs(state.points);
+  // tip runs: a pin where it paused and where it resumed, no line in between
+  let tip = 0;
+  rs.forEach((r, i) => { if (r.pauseBefore && i) {
+    tip++;
+    const a = rs[i - 1].pts[rs[i - 1].pts.length - 1], b = r.pts[0];
+    L.marker([a[0], a[1]], { icon: pinIcon(`⏸ Tip ${tip}`, "pause") }).addTo(routeLayer);
+    L.marker([b[0], b[1]], { icon: pinIcon(`▶ Resume ${tip}`, "resume") }).addTo(routeLayer);
+  } });
+  const lastPt = state.points[state.points.length - 1];
+  // paused right now (or finished while paused): pin at the last recorded point
+  if ((state.paused || state.resumeNext || state.endedPaused) && lastPt)
+    L.marker([lastPt[0], lastPt[1]], { icon: pinIcon(`⏸ Tip ${tip + 1}`, "pause") }).addTo(routeLayer);
   // stretches that weren't recorded: grey dashes, drawn first so the live line stays the top layer
   rs.forEach((r, i) => { if (r.gapBefore && i) {
     const a = rs[i - 1].pts[rs[i - 1].pts.length - 1], b = r.pts[0];
@@ -159,15 +190,16 @@ function redraw() {
 
 // consecutive points with the same mode; each run shares its first point with
 // the end of the previous one so the line has no joins missing - except after
-// a stretch that wasn't recorded (p[5] = 1), which starts a fresh run
+// a break (not recorded, or a tip-run pause), which starts a fresh run
 function runs(points) {
   const out = [];
   for (let i = 0; i < points.length; i++) {
-    const p = points[i], mode = p[3] || 0, gap = !!p[5];
+    const p = points[i], mode = p[3] || 0, brk = p[5] || 0;
     const cur = out[out.length - 1];
-    if (!cur || cur.mode !== mode || gap) {
-      const start = cur && !gap ? [cur.pts[cur.pts.length - 1]] : [];
-      out.push({ mode, rev: mode === 1, travel: mode === 2, gapBefore: gap, pts: start.concat([p]) });
+    if (!cur || cur.mode !== mode || brk) {
+      const start = cur && !brk ? [cur.pts[cur.pts.length - 1]] : [];
+      out.push({ mode, rev: mode === 1, travel: mode === 2, gapBefore: brk === 1, pauseBefore: brk === 2,
+                 pts: start.concat([p]) });
     } else cur.pts.push(p);
   }
   return out;
@@ -192,13 +224,18 @@ function onFix(lat, lon, acc) {
   else if (follow) map.panTo([lat, lon], { animate: true });
   setGps(acc <= MAX_ACCURACY_M ? "good" : "poor", acc);
 
-  if (!state.started || state.finished || acc > MAX_ACCURACY_M) return;
+  if (!state.started || state.finished || state.paused || acc > MAX_ACCURACY_M) return;
   const pts = state.points, last = pts[pts.length - 1];
   const p = [+lat.toFixed(6), +lon.toFixed(6), Date.now(), modeNow(), Math.round(acc)];
   if (last && last[3] === p[3] && dist(last, p) < MIN_MOVE_M) return;
-  // a big jump after a silence = the page was hidden or GPS dropped out while
-  // the lorry moved; don't pretend we know the route in between
-  if (last && p[2] - last[2] > GAP_SECONDS * 1000 && dist(last, p) > GAP_METRES) p.push(1);
+  if (state.resumeNext && last) {
+    p.push(2);                          // first point after a tip run: starts a new line
+    state.resumeNext = false;
+  } else if (last && p[2] - last[2] > GAP_SECONDS * 1000 && dist(last, p) > GAP_METRES) {
+    // a big jump after a silence = the page was hidden or GPS dropped out while
+    // the lorry moved; don't pretend we know the route in between
+    p.push(1);
+  }
   pts.push(p);
   save();
   const runsNow = runs(pts), run = runsNow[runsNow.length - 1];
@@ -230,16 +267,32 @@ setInterval(() => { if (lastFix && Date.now() - lastFix > 30000) setGps("lost");
 // ---------------------------------------------------------------------------
 // Keep the screen on while recording (the browser stops GPS if it sleeps)
 // ---------------------------------------------------------------------------
+// It can't stop someone pressing the power button: a web page can't record with
+// the screen off, so that shows up as a "Not recorded" gap.
 let wakeLock = null;
 async function keepAwake() {
   try { if ("wakeLock" in navigator && !wakeLock) {
     wakeLock = await navigator.wakeLock.request("screen");
-    wakeLock.addEventListener("release", () => { wakeLock = null; });
+    wakeLock.addEventListener("release", () => { wakeLock = null; showWake(); });
   } } catch (e) {}
+  showWake();
 }
+function showWake() {
+  const recording = state.started && !state.finished && !state.paused;
+  const el = $("wakeStat");
+  el.hidden = !recording;
+  el.className = wakeLock ? "ok" : "bad";
+  $("tWake").textContent = wakeLock ? "Screen kept on ✓"
+    : "wakeLock" in navigator ? "Screen may sleep - tap the map"
+    : "Screen may sleep - set screen timeout to 30 min";
+}
+// some browsers only grant the lock after a tap on the page
+document.addEventListener("pointerdown", () => {
+  if (state.started && !state.finished && !state.paused && !wakeLock) keepAwake();
+});
 let hiddenAt = null, warnUntil = 0;
 document.addEventListener("visibilitychange", () => {
-  const recording = state.started && !state.finished;
+  const recording = state.started && !state.finished && !state.paused;
   if (document.visibilityState === "hidden") { hiddenAt = Date.now(); return; }
   if (recording) keepAwake();
   const away = hiddenAt ? Date.now() - hiddenAt : 0;
@@ -265,9 +318,13 @@ function render() {
   // before the round all four show (TRAVEL greyed out); once started, START goes
   $("btnStart").hidden = rec;
   $("btnStart").disabled = !!state.started;
-  $("btnTravel").disabled = !rec || state.reversing;
-  $("btnReverse").disabled = !rec;
+  $("btnTravel").disabled = !rec || state.reversing || state.paused;
+  $("btnReverse").disabled = !rec || state.paused;
   $("btnFinish").disabled = !rec;
+  $("btnPause").hidden = !rec;              // only during the round, so a phone never shows five buttons
+  $("btnPause").disabled = state.reversing;
+  $("btnPause").classList.toggle("on", !!state.paused);
+  $("btnPause").textContent = state.paused ? "RESUME" : "PAUSE";
   $("roundName").disabled = !!state.started;
   $("roundName").value = state.name || $("roundName").value;
   $("btnReverse").classList.toggle("on", state.reversing);
@@ -276,10 +333,11 @@ function render() {
   $("btnTravel").textContent = state.travelling ? "COLLECTING" : "TRAVEL";
   const b = $("banner");
   if (Date.now() < warnUntil && rec) { $("done").classList.remove("show"); updateStats(); return; }
-  b.className = rec ? ["fwd", "rev", "trv"][modeNow()] : "";
+  b.className = rec ? (state.paused ? "pause" : ["fwd", "rev", "trv"][modeNow()]) : "";
   const firstLeg = state.travelling && !state.points.some(p => p[3] === 0);
   b.textContent = !state.started ? "Tap START at the depot - it records the drive out in PURPLE"
     : state.finished ? "Round finished"
+    : state.paused ? "PAUSED (tip run / break) - nothing is recorded. Tap RESUME when you're back where you left the round."
     : state.reversing ? "REVERSING - line is RED. Stop, then tap DONE REVERSING."
     : firstLeg ? "TRAVELLING to the first street - line is PURPLE. Tap COLLECTING when you start collecting."
     : state.travelling ? "TRAVELLING - line is PURPLE. Tap COLLECTING when you start collecting again."
@@ -304,14 +362,29 @@ function updateStats() {
   for (let i = 1; i < pts.length; i++) if (pts[i][5]) { gaps++; gapM += dist(pts[i - 1], pts[i]); }
   $("gapStat").hidden = !gaps;
   $("tGap").textContent = `${gaps}× (${(gapM / 1000).toFixed(1)} km)`;
+  const tips = pts.filter(p => p[5] === 2).length + (state.paused || state.resumeNext || state.endedPaused ? 1 : 0);
+  $("tipStat").hidden = !tips;
+  $("tTip").textContent = tips;
+  showWake();
 }
 setInterval(() => { if (state.started && !state.finished) updateStats(); }, 10000);
 
 $("btnStart").onclick = () => {
   // every round starts with the drive out from the depot, so START = travelling
-  state = { name: $("roundName").value.trim() || "Round " + new Date().toLocaleDateString("en-GB"),
-            started: Date.now(), finished: null, reversing: false, travelling: true, points: [] };
+  state = Object.assign(blankState(), {
+    name: $("roundName").value.trim() || "Round " + new Date().toLocaleDateString("en-GB"),
+    started: Date.now(), travelling: true });
   save(); redraw(); render(); keepAwake();
+};
+// PAUSE for a tip run or break: nothing recorded until RESUME, and the screen may sleep.
+// RESUME carries on in the same mode (collecting or travelling) with a fresh line.
+$("btnPause").onclick = () => {
+  warnUntil = 0;
+  state.paused = !state.paused;
+  if (!state.paused) { state.resumeNext = true; keepAwake(); }
+  else if (wakeLock) wakeLock.release();
+  save(); redraw(); render();
+  if (navigator.vibrate) navigator.vibrate(state.paused ? [200, 100, 200] : 80);
 };
 // repeat the last point in the new mode so the new colour starts exactly here
 function modeChanged() {
@@ -332,8 +405,10 @@ $("btnTravel").onclick = () => {
 };
 $("btnFinish").onclick = () => {
   if (!confirmFinish()) return;
-  state.reversing = false; state.travelling = false; state.finished = Date.now();
-  save(); render();
+  state.endedPaused = !!(state.paused || state.resumeNext);   // finished at the tip without resuming
+  state.reversing = false; state.travelling = false; state.paused = false; state.resumeNext = false;
+  state.finished = Date.now();
+  save(); redraw(); render();
   if (wakeLock) wakeLock.release();
 };
 let finishArmed = 0;
@@ -350,7 +425,7 @@ $("btnNew").onclick = () => {
     setTimeout(() => { $("btnNew").dataset.armed = ""; $("btnNew").textContent = "New round"; }, 3000);
     return;
   }
-  state = { name: "", started: null, finished: null, reversing: false, travelling: false, points: [] };
+  state = blankState();
   $("roundName").value = ""; save(); redraw(); render();
 };
 
@@ -361,6 +436,15 @@ const esc = s => String(s).replace(/[<>&"]/g, c => ({ "<": "&lt;", ">": "&gt;", 
 const iso = t => new Date(t).toISOString();
 const fileBase = () => (state.name || "round").replace(/[^\w\- ]+/g, "").trim().replace(/\s+/g, "_");
 
+// every tip run: where it paused, and where it resumed (null if the round ended paused)
+function tipStops() {
+  const rs = runs(state.points), out = [];
+  rs.forEach((r, i) => { if (r.pauseBefore && i) out.push({ pause: rs[i - 1].pts[rs[i - 1].pts.length - 1], resume: r.pts[0] }); });
+  const last = state.points[state.points.length - 1];
+  if (state.endedPaused && last) out.push({ pause: last, resume: null });
+  return out;
+}
+
 function toGpx() {
   const rs = runs(state.points);
   let n = 0, out = [`<?xml version="1.0" encoding="UTF-8"?>`,
@@ -369,6 +453,12 @@ function toGpx() {
   rs.forEach(r => { if (r.rev) { n++;
     const p = r.pts[0];
     out.push(`<wpt lat="${p[0]}" lon="${p[1]}"><name>Reverse ${n}</name><type>reverse</type></wpt>`); } });
+  tipStops().forEach((s, i) => {
+    out.push(`<wpt lat="${s.pause[0]}" lon="${s.pause[1]}"><time>${iso(s.pause[2])}</time>` +
+             `<name>Tip ${i + 1} (paused)</name><type>pause</type></wpt>`);
+    if (s.resume) out.push(`<wpt lat="${s.resume[0]}" lon="${s.resume[1]}"><time>${iso(s.resume[2])}</time>` +
+                           `<name>Resume ${i + 1}</name><type>resume</type></wpt>`);
+  });
   const count = [0, 0, 0], names = ["Collecting", "Reverse", "Travel"], types = ["forward", "reverse", "travel"];
   for (const r of rs) {
     const label = `${names[r.mode]} ${++count[r.mode]}`;
@@ -399,6 +489,10 @@ function toKml() {
     else if (r.travel) trv.push(line(r, ++t));
     else fwd.push(line(r, ++f));
   }
+  const tips = tipStops().flatMap((s, i) => {
+    const pt = (p, name) => `<Placemark><name>${name}</name><Point><coordinates>${p[1]},${p[0]},0</coordinates></Point></Placemark>`;
+    return [pt(s.pause, `Tip ${i + 1} - paused here`), ...(s.resume ? [pt(s.resume, `Resume ${i + 1} - carry on from here`)] : [])];
+  });
   const first = state.points[0], last = state.points[state.points.length - 1];
   const se = first ? `<Placemark><name>Start</name><Point><coordinates>${first[1]},${first[0]},0</coordinates></Point></Placemark>` +
     `<Placemark><name>Finish</name><Point><coordinates>${last[1]},${last[0]},0</coordinates></Point></Placemark>` : "";
@@ -414,6 +508,7 @@ function toKml() {
 <Folder><name>Reversing (red)</name>${rev.join("")}${pins.join("")}</Folder>
 ${trv.length ? `<Folder><name>Travelling to next area (purple)</name>${trv.join("")}</Folder>` : ""}
 ${gaps.length ? `<Folder><name>Not recorded (grey) - route unknown</name>${gaps.join("")}</Folder>` : ""}
+${tips.length ? `<Folder><name>Tip runs (paused)</name>${tips.join("")}</Folder>` : ""}
 <Folder><name>Start / finish</name>${se}</Folder>
 </Document></kml>`;
 }
@@ -465,7 +560,7 @@ if (state.points.length > 1) {
 // split screen / rotating the tablet changes the map's size
 window.addEventListener("resize", () => map.invalidateSize());
 startGps();
-if (state.started && !state.finished) keepAwake();
+if (state.started && !state.finished && !state.paused) keepAwake();
 </script>
 </body>
 </html>

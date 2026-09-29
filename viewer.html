@@ -33,6 +33,10 @@
             box-shadow: 0 1px 4px rgba(0,0,0,.4); }
   .trvpin { background: var(--purple); color: #fff; font-weight: 800; font-size: 12px; border-radius: 6px;
             padding: 2px 6px; white-space: nowrap; border: 2px solid #fff; box-shadow: 0 1px 4px rgba(0,0,0,.4); }
+  .pin { font-weight: 800; font-size: 12px; color: #fff; border-radius: 6px; padding: 2px 6px;
+         white-space: nowrap; border: 2px solid #fff; box-shadow: 0 1px 4px rgba(0,0,0,.4); }
+  .pin.pause { background: #8a6d1f; }
+  .pin.resume { background: #1a9c3c; }
   .sfpin { background: var(--ink); color: #fff; font-weight: 700; font-size: 12px; border-radius: 6px;
            padding: 2px 6px; white-space: nowrap; border: 2px solid #fff; }
   .wrap { position: relative; flex: 1; display: flex; min-height: 0; }
@@ -104,7 +108,13 @@ function parseGpx(text) {
   }
   const name = (doc.querySelector("metadata > name") || doc.querySelector("trk > name") || {}).textContent;
   if (!out.length) throw new Error("No route found in that file.");
-  return { name, runs: out };
+  // tip-run pause / resume points
+  const stops = { pause: [], resume: [] };
+  for (const w of doc.getElementsByTagName("wpt")) {
+    const type = ((w.getElementsByTagName("type")[0] || {}).textContent || "").trim().toLowerCase();
+    if (type in stops) stops[type].push([+w.getAttribute("lat"), +w.getAttribute("lon")]);
+  }
+  return { name, runs: out, stops };
 }
 
 // ---------------------------------------------------------------------------
@@ -186,11 +196,23 @@ function draw(route) {
   buildPieces(runs);
   document.getElementById("title").textContent = route.name || "Round Viewer";
   document.getElementById("empty").hidden = true;
-  let n = 0, gaps = 0;
-  // where one section doesn't start where the last one ended, the recording
-  // paused (page hidden / GPS lost): show that honestly, not as a route
+  let n = 0, gaps = 0, tip = 0;
+  const stops = route.stops || { pause: [], resume: [] };
+  const near = (list, p) => list.some(q => dist(q, p) <= 30);
+  const tipPin = (p, html, cls, text) => L.marker(p, { icon: L.divIcon({ className: "", iconSize: null, iconAnchor: [0, 12],
+    html: `<div class="pin ${cls}">${html}</div>` }), zIndexOffset: 950 }).bindPopup(text).addTo(layer);
+  // where one section doesn't start where the last one ended, either the driver
+  // paused for a tip run (pins, no line), or the recording stopped (page hidden /
+  // GPS lost): show that honestly, not as a route
   for (let i = 1; i < runs.length; i++) {
     const a = runs[i - 1].pts[runs[i - 1].pts.length - 1], b = runs[i].pts[0];
+    if (near(stops.pause, a) && near(stops.resume, b)) {
+      tip++;
+      tipPin(a, `⏸ Tip ${tip}`, "pause", `<b>Tip run ${tip}</b><br>The round pauses here for the tip. ` +
+             `No route is recorded to the tip - go your usual way. Come back to <b>▶ Resume ${tip}</b>.`);
+      tipPin(b, `▶ Resume ${tip}`, "resume", `<b>Resume ${tip}</b><br>Back from the tip: carry on the round from here.`);
+      continue;
+    }
     if (dist(a, b) > 25) {
       gaps++;
       L.polyline([a, b], { color: "#6b7280", weight: 5, dashArray: "8 10" })
@@ -198,6 +220,10 @@ function draw(route) {
         .addTo(layer);
     }
   }
+  // finished at the tip without resuming
+  const endPt = runs[runs.length - 1].pts[runs[runs.length - 1].pts.length - 1];
+  if (near(stops.pause, endPt) && stops.pause.length > tip)
+    tipPin(endPt, `⏸ Tip ${tip + 1}`, "pause", `<b>Tip run ${tip + 1}</b><br>The round goes to the tip from here.`);
   document.getElementById("gapKey").hidden = !gaps;
   document.getElementById("trvKey").hidden = !runs.some(r => r.travel);
   let t = 0;
@@ -271,16 +297,28 @@ const q = new URLSearchParams(location.search).get("route");
 if (q) fetch(q).then(r => { if (!r.ok) throw new Error("Couldn't load " + q); return r.text(); })
   .then(t => draw(parseGpx(t))).catch(err => alert(err.message));
 
+// Keep the screen on while following the round with "Show me"
+let wakeLock = null;
+async function keepAwake() {
+  try { if ("wakeLock" in navigator && !wakeLock && watch !== null) {
+    wakeLock = await navigator.wakeLock.request("screen");
+    wakeLock.addEventListener("release", () => { wakeLock = null; });
+  } } catch (e) {}
+}
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") keepAwake(); });
+
 // Live position
 let watch = null, me = null, first = true;
 document.getElementById("btnMe").onclick = function () {
   if (watch !== null) {
     navigator.geolocation.clearWatch(watch); watch = null;
     if (me) { map.removeLayer(me); me = null; }
+    if (wakeLock) wakeLock.release();
     this.classList.remove("on"); this.textContent = "Show me"; return;
   }
   if (!("geolocation" in navigator)) { alert("No location on this device."); return; }
   this.classList.add("on"); this.textContent = "Showing me"; first = true;
+  setTimeout(keepAwake, 0);
   watch = navigator.geolocation.watchPosition(pos => {
     const p = [pos.coords.latitude, pos.coords.longitude];
     if (!me) me = L.circleMarker(p, { radius: 9, color: "#fff", weight: 3, fillColor: "#2d5fd3", fillOpacity: 1 }).addTo(map);
