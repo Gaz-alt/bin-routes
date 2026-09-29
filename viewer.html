@@ -60,7 +60,8 @@ const map = L.map("map").setView([54.5, -2.5], 6);
 L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
   maxZoom: 19, attribution: "&copy; OpenStreetMap contributors"
 }).addTo(map);
-const layer = L.layerGroup().addTo(map);
+const lines = L.layerGroup().addTo(map);    // route lines (redrawn on zoom)
+const layer = L.layerGroup().addTo(map);    // pins, gap lines
 const arrows = L.layerGroup().addTo(map);
 let runs = [];
 
@@ -98,9 +99,83 @@ function parseGpx(text) {
   return { name, runs: out };
 }
 
+// ---------------------------------------------------------------------------
+// "Reverse in, drive back out": when the section after a reverse retraces the
+// same street, both are drawn side by side like two lanes (each on its own
+// left), instead of one line hiding the other.
+// ---------------------------------------------------------------------------
+const SAME_STREET_M = 15;     // drive-out points this close to the reversed street count as the same street
+const LANE_PX = 5;            // how far each lane sits from the street centre (screen pixels)
+let pieces = [];              // what gets drawn: { mode, pts, lane (bool), shown }
+let reverseInfo = [];         // per reverse, in order: true if they drove back out the same street
+
+function toXY(p, lat0) {      // metres on a local flat grid, fine over a few km
+  return [p[1] * 111320 * Math.cos(lat0 * Math.PI / 180), p[0] * 110540];
+}
+function distToPath(p, path) {
+  const lat0 = p[0], q = toXY(p, lat0);
+  let best = Infinity;
+  for (let i = 1; i < path.length; i++) {
+    const a = toXY(path[i - 1], lat0), b = toXY(path[i], lat0);
+    const dx = b[0] - a[0], dy = b[1] - a[1], len2 = dx * dx + dy * dy;
+    const t = len2 ? Math.max(0, Math.min(1, ((q[0] - a[0]) * dx + (q[1] - a[1]) * dy) / len2)) : 0;
+    best = Math.min(best, Math.hypot(q[0] - a[0] - t * dx, q[1] - a[1] - t * dy));
+  }
+  return best;
+}
+const pathLen = pts => pts.reduce((s, p, i) => i ? s + dist(pts[i - 1], p) : 0, 0);
+
+function buildPieces(runs) {
+  pieces = []; reverseInfo = [];
+  for (let i = 0; i < runs.length; i++) {
+    const r = runs[i];
+    if (!r.rev) { if (!r.used) pieces.push({ mode: r.mode, pts: r.pts, lane: false }); continue; }
+    const next = runs[i + 1];
+    let paired = false;
+    if (next && !next.rev && dist(r.pts[r.pts.length - 1], next.pts[0]) <= 25) {
+      // how far the next section runs back along the reversed street
+      let k = 0;
+      while (k < next.pts.length && distToPath(next.pts[k], r.pts) <= SAME_STREET_M) k++;
+      const revLen = pathLen(r.pts), outLen = pathLen(next.pts.slice(0, k));
+      if (revLen >= 15 && k >= 2 && outLen >= 0.6 * revLen) {
+        paired = true;
+        pieces.push({ mode: 1, pts: r.pts, lane: true });
+        pieces.push({ mode: next.mode, pts: next.pts.slice(0, k), lane: true });
+        if (k < next.pts.length) pieces.push({ mode: next.mode, pts: next.pts.slice(k - 1), lane: false });
+        next.used = true;
+      }
+    }
+    if (!paired) pieces.push({ mode: 1, pts: r.pts, lane: false });
+    reverseInfo.push(paired);
+  }
+}
+
+// shift a line LANE_PX to the left of its own direction of travel
+function laneOf(pts) {
+  const xy = pts.map(p => map.latLngToLayerPoint(p));
+  return xy.map((pt, i) => {
+    const a = xy[Math.max(0, i - 1)], b = xy[Math.min(xy.length - 1, i + 1)];
+    const dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy) || 1;
+    const ll = map.layerPointToLatLng(L.point(pt.x + dy / len * LANE_PX, pt.y - dx / len * LANE_PX));
+    return [ll.lat, ll.lng];
+  });
+}
+
+function drawLines() {
+  lines.clearLayers();
+  // collecting, then travelling, then reversing on top, so a street used more than
+  // one way still shows its red reverse
+  for (const p of [0, 2, 1].flatMap(m => pieces.filter(p => p.mode === m))) {
+    p.shown = p.lane ? laneOf(p.pts) : p.pts;
+    L.polyline(p.shown, { color: "#fff", weight: p.lane ? 9 : 11, opacity: .8 }).addTo(lines);   // halo
+    L.polyline(p.shown, { color: COLOURS[p.mode], weight: p.lane ? 6 : (p.mode === 1 ? 8 : 7) }).addTo(lines);
+  }
+}
+
 function draw(route) {
   layer.clearLayers();
   runs = route.runs;
+  buildPieces(runs);
   document.getElementById("title").textContent = route.name || "Round Viewer";
   document.getElementById("empty").hidden = true;
   let n = 0, gaps = 0;
@@ -117,12 +192,6 @@ function draw(route) {
   }
   document.getElementById("gapKey").hidden = !gaps;
   document.getElementById("trvKey").hidden = !runs.some(r => r.travel);
-  // collecting, then travelling, then reversing on top, so a street used more than
-  // one way still shows its red reverse
-  for (const r of [0, 2, 1].flatMap(m => runs.filter(r => r.mode === m))) {
-    L.polyline(r.pts, { color: "#fff", weight: 11, opacity: .8 }).addTo(layer);   // halo for contrast
-    L.polyline(r.pts, { color: COLOURS[r.mode], weight: r.rev ? 8 : 7 }).addTo(layer);
-  }
   let t = 0;
   for (const r of runs) {
     if (r.travel) {
@@ -133,31 +202,37 @@ function draw(route) {
         .addTo(layer);
     }
     if (r.rev) {
+      const outSame = reverseInfo[n];
       n++;
       L.marker(r.pts[0], { icon: L.divIcon({ className: "", html: `<div class="revpin">R${n}</div>`,
         iconSize: [26, 26], iconAnchor: [13, 13] }), zIndexOffset: 1000 })
-        .bindPopup(`<b>Reverse ${n}</b><br>Reverse down this street (red line), don't drive in.`).addTo(layer);
+        .bindPopup(`<b>Reverse ${n}</b><br>` + (outSame
+          ? `Reverse <b>in</b> down this street (red), then drive back <b>out</b> forwards the same way (${r.mode === 1 && runs[runs.indexOf(r) + 1]?.travel ? "purple" : "green"}).`
+          : `Reverse down this street (red line), don't drive in. Carry on from the far end of the red line.`))
+        .addTo(layer);
     }
   }
   const all = runs.flatMap(r => r.pts);
   const pin = (p, t) => L.marker(p, { icon: L.divIcon({ className: "", html: `<div class="sfpin">${t}</div>`,
     iconSize: null, iconAnchor: [20, 12] }) }).addTo(layer);
   pin(all[0], "START"); pin(all[all.length - 1], "FINISH");
-  map.fitBounds(L.latLngBounds(all), { padding: [30, 30] });
+  map.fitBounds(L.latLngBounds(all), { padding: [30, 30], animate: false });
+  drawLines();
   drawArrows();
 }
 
 // Direction arrows every ~120 px along the forward sections, redrawn on zoom
 function drawArrows() {
   arrows.clearLayers();
-  if (!runs.length) return;
+  if (!pieces.length) return;
   const metresPerPx = 40075016 * Math.cos(map.getCenter().lat * Math.PI / 180) / Math.pow(2, map.getZoom() + 8);
   const gap = 120 * metresPerPx;
   const view = map.getBounds().pad(0.2);
-  for (const r of runs) {
-    let acc = gap / 2;
-    for (let i = 1; i < r.pts.length; i++) {
-      const a = r.pts[i - 1], b = r.pts[i], d = dist(a, b);
+  for (const r of pieces) {
+    const pts = r.shown || r.pts;
+    let acc = r.lane ? gap / 4 : gap / 2;    // short lanes still get an arrow each
+    for (let i = 1; i < pts.length; i++) {
+      const a = pts[i - 1], b = pts[i], d = dist(a, b);
       if (d === 0) continue;
       while (acc <= d) {
         const f = acc / d, p = [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f];
@@ -174,6 +249,7 @@ function drawArrows() {
     }
   }
 }
+map.on("zoomend", () => { if (pieces.length) drawLines(); });  // lanes are a fixed pixel width apart
 map.on("zoomend moveend", drawArrows);
 
 document.getElementById("file").onchange = e => {
