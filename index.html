@@ -32,6 +32,11 @@
   button:disabled { opacity: .35; cursor: default; }
   #btnStart { background: var(--green); }
   #btnReverse { background: var(--red); flex: 2; font-size: 22px; }
+  @media (max-width: 480px) {          /* four buttons on a phone before START */
+    #controls { gap: 6px; padding-left: 8px; padding-right: 8px; }
+    button { padding: 16px 4px; font-size: 14px; }
+    #btnReverse { font-size: 18px; flex: 1.6; }
+  }
   #btnReverse.on { background: var(--green); }
   #btnTravel { background: var(--purple); }
   #btnTravel.on { background: var(--green); }
@@ -63,7 +68,7 @@
 <div id="banner">Tap START at the depot</div>
 <div id="controls">
   <button id="btnStart">START</button>
-  <button id="btnTravel" hidden>TRAVEL</button>
+  <button id="btnTravel" disabled>TRAVEL</button>
   <button id="btnReverse" disabled>REVERSE</button>
   <button id="btnFinish" disabled>FINISH</button>
 </div>
@@ -241,11 +246,10 @@ const $ = id => document.getElementById(id);
 
 function render() {
   const rec = !!state.started && !state.finished;
-  // before the round: START; during it TRAVEL takes START's place
+  // before the round all four show (TRAVEL greyed out); once started, START goes
   $("btnStart").hidden = rec;
   $("btnStart").disabled = !!state.started;
-  $("btnTravel").hidden = !rec;
-  $("btnTravel").disabled = state.reversing;
+  $("btnTravel").disabled = !rec || state.reversing;
   $("btnReverse").disabled = !rec;
   $("btnFinish").disabled = !rec;
   $("roundName").disabled = !!state.started;
@@ -257,11 +261,13 @@ function render() {
   const b = $("banner");
   if (Date.now() < warnUntil && rec) { $("done").classList.remove("show"); updateStats(); return; }
   b.className = rec ? ["fwd", "rev", "trv"][modeNow()] : "";
-  b.textContent = !state.started ? "Tap START at the depot"
+  const firstLeg = state.travelling && !state.points.some(p => p[3] === 0);
+  b.textContent = !state.started ? "Tap START at the depot - it records the drive out in PURPLE"
     : state.finished ? "Round finished"
     : state.reversing ? "REVERSING - line is RED. Stop, then tap DONE REVERSING."
-    : state.travelling ? "TRAVELLING to next area - line is PURPLE. Tap COLLECTING when you get there."
-    : "Collecting - line is GREEN. Stop before tapping REVERSE. Tap TRAVEL when leaving the area.";
+    : firstLeg ? "TRAVELLING to the first street - line is PURPLE. Tap COLLECTING when you start collecting."
+    : state.travelling ? "TRAVELLING - line is PURPLE. Tap COLLECTING when you start collecting again."
+    : "Collecting - line is GREEN. Stop before tapping REVERSE. Tap TRAVEL when leaving the area or heading back.";
   $("done").classList.toggle("show", !!state.finished);
   updateStats();
 }
@@ -286,8 +292,9 @@ function updateStats() {
 setInterval(() => { if (state.started && !state.finished) updateStats(); }, 10000);
 
 $("btnStart").onclick = () => {
+  // every round starts with the drive out from the depot, so START = travelling
   state = { name: $("roundName").value.trim() || "Round " + new Date().toLocaleDateString("en-GB"),
-            started: Date.now(), finished: null, reversing: false, travelling: false, points: [] };
+            started: Date.now(), finished: null, reversing: false, travelling: true, points: [] };
   save(); redraw(); render(); keepAwake();
 };
 // repeat the last point in the new mode so the new colour starts exactly here
