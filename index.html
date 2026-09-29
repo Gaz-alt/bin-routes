@@ -32,6 +32,22 @@
   button:disabled { opacity: .35; cursor: default; }
   #btnStart { background: var(--green); }
   #btnReverse { background: var(--red); flex: 2; font-size: 22px; }
+  /* the buttons must never be pushed off screen: the map is what shrinks */
+  body { overflow: hidden; }
+  #map { min-height: 90px; }
+  header, #status, #banner, #controls, #done { flex: none; }
+  @media (max-height: 640px) {         /* small pop-up window / phone on its side */
+    header { padding: 4px 8px; }
+    header h1 { display: none; }
+    #roundName { padding: 5px 8px; font-size: 14px; }
+    #status { font-size: 12px; padding: 3px 8px; gap: 8px; }
+    #banner { padding: 5px 8px; font-size: 13px; }
+    #controls { padding-top: 6px; padding-bottom: calc(6px + env(safe-area-inset-bottom, 0px)); }
+    button { padding: 12px 6px; }
+    #btnReverse { font-size: 18px; }
+    #done { padding: 6px 8px; font-size: 13px; overflow-y: auto; max-height: 45vh; }
+    #done button { padding: 10px 6px; }
+  }
   @media (max-width: 480px) {          /* four buttons on a phone before START */
     #controls { gap: 6px; padding-left: 8px; padding-right: 8px; }
     button { padding: 16px 4px; font-size: 14px; }
