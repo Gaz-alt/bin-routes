@@ -1,0 +1,448 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Round Recorder</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<style>
+  :root { --green: #1a9c3c; --red: #d62b2b; --purple: #7c3aed; --ink: #1d2433; --muted: #5b6475; --bg: #f4f5f7; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { font: 16px/1.35 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: var(--ink);
+         background: var(--bg); display: flex; flex-direction: column; }
+  header { padding: 8px 12px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+           background: #fff; border-bottom: 1px solid #dde1e7; }
+  header h1 { font-size: 17px; margin: 0; }
+  #roundName { flex: 1 1 180px; font-size: 16px; padding: 8px 10px; border: 1px solid #c9ced8; border-radius: 8px; }
+  #status { font-size: 14px; color: var(--muted); padding: 6px 12px; background: #fff;
+            border-bottom: 1px solid #dde1e7; display: flex; gap: 14px; flex-wrap: wrap; }
+  #status b { color: var(--ink); }
+  #gpsDot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: #aaa; margin-right: 4px; }
+  #map { flex: 1; min-height: 200px; }
+  #banner { padding: 10px 12px; font-weight: 600; text-align: center; color: #fff; background: var(--muted); }
+  #banner.fwd { background: var(--green); }
+  #banner.rev { background: var(--red); }
+  #banner.trv { background: var(--purple); }
+  #banner.warn { background: #f0b400; color: #000; }
+  #controls { display: flex; gap: 10px; padding: 10px 12px calc(10px + env(safe-area-inset-bottom, 0px));
+              background: #fff; border-top: 1px solid #dde1e7; }
+  button { font: inherit; font-weight: 700; border: 0; border-radius: 12px; padding: 18px 10px;
+           cursor: pointer; flex: 1; color: #fff; touch-action: manipulation; }
+  button:disabled { opacity: .35; cursor: default; }
+  #btnStart { background: var(--green); }
+  #btnReverse { background: var(--red); flex: 2; font-size: 22px; }
+  #btnReverse.on { background: var(--green); }
+  #btnTravel { background: var(--purple); }
+  #btnTravel.on { background: var(--green); }
+  #btnFinish { background: var(--ink); }
+  .secondary { background: #e7eaf0; color: var(--ink); }
+  #done { display: none; padding: 12px; background: #fff; border-top: 1px solid #dde1e7; }
+  #done.show { display: block; }
+  #done .row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 8px; }
+  #done button { padding: 14px 10px; flex: 1 1 140px; }
+  #done .dl { background: #2d5fd3; }
+  .demo-tag { background: #f0b400; color: #000; font-size: 12px; font-weight: 700; padding: 2px 8px; border-radius: 99px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Round Recorder</h1>
+  <input id="roundName" placeholder="Round name, e.g. Monday Round 3" autocomplete="off">
+  <span id="demoTag" class="demo-tag" hidden>DEMO</span>
+</header>
+<div id="status">
+  <span><span id="gpsDot"></span><b id="gpsText">GPS off</b></span>
+  <span>Time <b id="tTime">0:00</b></span>
+  <span>Distance <b id="tDist">0.0 km</b></span>
+  <span>Reverses <b id="tRev">0</b></span>
+  <span>Travel <b id="tTravel">0.0 km</b></span>
+  <span id="gapStat" hidden>Not recorded <b id="tGap">0</b></span>
+</div>
+<div id="map"></div>
+<div id="banner">Tap START at the depot</div>
+<div id="controls">
+  <button id="btnStart">START</button>
+  <button id="btnTravel" hidden>TRAVEL</button>
+  <button id="btnReverse" disabled>REVERSE</button>
+  <button id="btnFinish" disabled>FINISH</button>
+</div>
+<div id="done">
+  <b>Round saved.</b> Send these files to whoever sets up the relief drivers' map:
+  <div class="row">
+    <button class="dl" id="btnShare">Share / send files</button>
+    <button class="dl" id="btnGpx">Download GPX</button>
+    <button class="dl" id="btnKml">Download KML (Google Maps)</button>
+    <button class="secondary" id="btnNew">New round</button>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+"use strict";
+// ---------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------
+const MAX_ACCURACY_M = 35;   // ignore GPS fixes worse than this
+const MIN_MOVE_M = 3;        // ignore jitter smaller than this while stopped
+const GAP_SECONDS = 15;      // no fix for this long AND
+const GAP_METRES = 60;       // moved this far = a stretch we didn't record
+const DEMO = new URLSearchParams(location.search).has("demo");
+const STORE_KEY = DEMO ? "roundRecorder.demo" : "roundRecorder.v1";  // practice runs never mix with real rounds
+
+// ---------------------------------------------------------------------------
+// State (saved to the tablet as we go, so a reload or crash loses nothing)
+// ---------------------------------------------------------------------------
+let state = { name: "", started: null, finished: null, reversing: false, travelling: false, points: [] };
+// point: [lat, lon, time_ms, mode, accuracy_m, gapBefore?]
+// mode: 0 = collecting (green), 1 = reversing (red), 2 = travelling to next area (purple)
+const COLOURS = ["#1a9c3c", "#d62b2b", "#7c3aed"];
+const modeNow = () => state.reversing ? 1 : state.travelling ? 2 : 0;
+
+function save() { try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); } catch (e) {} }
+function load() {
+  try { const s = JSON.parse(localStorage.getItem(STORE_KEY)); if (s && s.points) state = s; } catch (e) {}
+}
+
+// ---------------------------------------------------------------------------
+// Map
+// ---------------------------------------------------------------------------
+const map = L.map("map", { zoomControl: true }).setView([54.5, -2.5], 6);
+L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  maxZoom: 19, attribution: "&copy; OpenStreetMap contributors"
+}).addTo(map);
+const routeLayer = L.layerGroup().addTo(map);
+const me = L.circleMarker([0, 0], { radius: 9, color: "#fff", weight: 3, fillColor: "#2d5fd3", fillOpacity: 1 });
+let follow = true;
+map.on("dragstart", () => { follow = false; });
+
+function redraw() {
+  routeLayer.clearLayers();
+  const rs = runs(state.points);
+  // stretches that weren't recorded: grey dashes, drawn first so the live line stays the top layer
+  rs.forEach((r, i) => { if (r.gapBefore && i) {
+    const a = rs[i - 1].pts[rs[i - 1].pts.length - 1], b = r.pts[0];
+    L.polyline([[a[0], a[1]], [b[0], b[1]]], { color: "#6b7280", weight: 5, dashArray: "8 10", opacity: .9 })
+      .bindTooltip("Not recorded").addTo(routeLayer);
+  } });
+  const last = state.finished ? null : rs[rs.length - 1];
+  // collecting, then travelling, then reversing on top; the current run last so
+  // live points extend the right line
+  const order = [0, 2, 1].flatMap(m => rs.filter(r => r.mode === m && r !== last));
+  for (const run of [...order, ...(last ? [last] : [])]) {
+    L.polyline(run.pts.map(p => [p[0], p[1]]), {
+      color: COLOURS[run.mode], weight: 7, opacity: .9
+    }).addTo(routeLayer);
+  }
+}
+
+// consecutive points with the same mode; each run shares its first point with
+// the end of the previous one so the line has no joins missing - except after
+// a stretch that wasn't recorded (p[5] = 1), which starts a fresh run
+function runs(points) {
+  const out = [];
+  for (let i = 0; i < points.length; i++) {
+    const p = points[i], mode = p[3] || 0, gap = !!p[5];
+    const cur = out[out.length - 1];
+    if (!cur || cur.mode !== mode || gap) {
+      const start = cur && !gap ? [cur.pts[cur.pts.length - 1]] : [];
+      out.push({ mode, rev: mode === 1, travel: mode === 2, gapBefore: gap, pts: start.concat([p]) });
+    } else cur.pts.push(p);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// GPS
+// ---------------------------------------------------------------------------
+let watchId = null, lastFix = null;
+
+function dist(a, b) {
+  const R = 6371000, r = Math.PI / 180;
+  const dLat = (b[0] - a[0]) * r, dLon = (b[1] - a[1]) * r;
+  const x = Math.sin(dLat / 2) ** 2 + Math.cos(a[0] * r) * Math.cos(b[0] * r) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(x));
+}
+
+function onFix(lat, lon, acc) {
+  lastFix = Date.now();
+  me.setLatLng([lat, lon]);
+  if (!map.hasLayer(me)) { me.addTo(map); if (follow) map.setView([lat, lon], 17, { animate: false }); }
+  else if (follow) map.panTo([lat, lon], { animate: true });
+  setGps(acc <= MAX_ACCURACY_M ? "good" : "poor", acc);
+
+  if (!state.started || state.finished || acc > MAX_ACCURACY_M) return;
+  const pts = state.points, last = pts[pts.length - 1];
+  const p = [+lat.toFixed(6), +lon.toFixed(6), Date.now(), modeNow(), Math.round(acc)];
+  if (last && last[3] === p[3] && dist(last, p) < MIN_MOVE_M) return;
+  // a big jump after a silence = the page was hidden or GPS dropped out while
+  // the lorry moved; don't pretend we know the route in between
+  if (last && p[2] - last[2] > GAP_SECONDS * 1000 && dist(last, p) > GAP_METRES) p.push(1);
+  pts.push(p);
+  save();
+  const runsNow = runs(pts), run = runsNow[runsNow.length - 1];
+  // cheap live update: redraw fully only when the mode changed
+  if (run.pts.length <= 2) redraw();
+  else routeLayer.getLayers().slice(-1)[0].addLatLng([p[0], p[1]]);
+  updateStats();
+}
+
+function startGps() {
+  if (DEMO) { startDemo(); return; }
+  if (!("geolocation" in navigator)) { setGps("none"); return; }
+  watchId = navigator.geolocation.watchPosition(
+    pos => onFix(pos.coords.latitude, pos.coords.longitude, pos.coords.accuracy),
+    err => setGps(err.code === 1 ? "denied" : "lost"),
+    { enableHighAccuracy: true, maximumAge: 0, timeout: 20000 });
+}
+
+function setGps(kind, acc) {
+  const dot = document.getElementById("gpsDot"), t = document.getElementById("gpsText");
+  const k = { good: ["#1a9c3c", `GPS good (±${Math.round(acc)} m)`],
+              poor: ["#f0b400", `GPS weak (±${Math.round(acc)} m)`],
+              lost: ["#d62b2b", "GPS lost"], denied: ["#d62b2b", "Location blocked - allow it in the browser"],
+              none: ["#d62b2b", "No GPS on this device"] }[kind];
+  dot.style.background = k[0]; t.textContent = k[1];
+}
+setInterval(() => { if (lastFix && Date.now() - lastFix > 30000) setGps("lost"); }, 5000);
+
+// ---------------------------------------------------------------------------
+// Keep the screen on while recording (the browser stops GPS if it sleeps)
+// ---------------------------------------------------------------------------
+let wakeLock = null;
+async function keepAwake() {
+  try { if ("wakeLock" in navigator && !wakeLock) {
+    wakeLock = await navigator.wakeLock.request("screen");
+    wakeLock.addEventListener("release", () => { wakeLock = null; });
+  } } catch (e) {}
+}
+let hiddenAt = null, warnUntil = 0;
+document.addEventListener("visibilitychange", () => {
+  const recording = state.started && !state.finished;
+  if (document.visibilityState === "hidden") { hiddenAt = Date.now(); return; }
+  if (recording) keepAwake();
+  const away = hiddenAt ? Date.now() - hiddenAt : 0;
+  hiddenAt = null;
+  if (recording && away > GAP_SECONDS * 1000) {
+    const m = Math.max(1, Math.round(away / 60000));
+    warnUntil = Date.now() + 20000;
+    const b = $("banner");
+    b.className = "warn";
+    b.textContent = `Recording paused for ${m} min while this page was hidden. ` +
+                    `Keep it on screen: split screen or pop-up view.`;
+    setTimeout(render, 20000);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Buttons
+// ---------------------------------------------------------------------------
+const $ = id => document.getElementById(id);
+
+function render() {
+  const rec = !!state.started && !state.finished;
+  // before the round: START; during it TRAVEL takes START's place
+  $("btnStart").hidden = rec;
+  $("btnStart").disabled = !!state.started;
+  $("btnTravel").hidden = !rec;
+  $("btnTravel").disabled = state.reversing;
+  $("btnReverse").disabled = !rec;
+  $("btnFinish").disabled = !rec;
+  $("roundName").disabled = !!state.started;
+  $("roundName").value = state.name || $("roundName").value;
+  $("btnReverse").classList.toggle("on", state.reversing);
+  $("btnReverse").textContent = state.reversing ? "DONE REVERSING" : "REVERSE";
+  $("btnTravel").classList.toggle("on", state.travelling);
+  $("btnTravel").textContent = state.travelling ? "COLLECTING" : "TRAVEL";
+  const b = $("banner");
+  if (Date.now() < warnUntil && rec) { $("done").classList.remove("show"); updateStats(); return; }
+  b.className = rec ? ["fwd", "rev", "trv"][modeNow()] : "";
+  b.textContent = !state.started ? "Tap START at the depot"
+    : state.finished ? "Round finished"
+    : state.reversing ? "REVERSING - line is RED. Stop, then tap DONE REVERSING."
+    : state.travelling ? "TRAVELLING to next area - line is PURPLE. Tap COLLECTING when you get there."
+    : "Collecting - line is GREEN. Stop before tapping REVERSE. Tap TRAVEL when leaving the area.";
+  $("done").classList.toggle("show", !!state.finished);
+  updateStats();
+}
+
+function updateStats() {
+  const pts = state.points;
+  let d = 0;
+  for (let i = 1; i < pts.length; i++) d += dist(pts[i - 1], pts[i]);
+  const end = state.finished || Date.now();
+  const s = state.started ? Math.floor((end - state.started) / 1000) : 0;
+  $("tTime").textContent = `${Math.floor(s / 3600)}:${String(Math.floor(s / 60) % 60).padStart(2, "0")}`;
+  $("tDist").textContent = (d / 1000).toFixed(1) + " km";
+  $("tRev").textContent = runs(pts).filter(r => r.rev).length;
+  let tr = 0;
+  for (let i = 1; i < pts.length; i++) if (pts[i][3] === 2 && !pts[i][5]) tr += dist(pts[i - 1], pts[i]);
+  $("tTravel").textContent = (tr / 1000).toFixed(1) + " km";
+  let gaps = 0, gapM = 0;
+  for (let i = 1; i < pts.length; i++) if (pts[i][5]) { gaps++; gapM += dist(pts[i - 1], pts[i]); }
+  $("gapStat").hidden = !gaps;
+  $("tGap").textContent = `${gaps}× (${(gapM / 1000).toFixed(1)} km)`;
+}
+setInterval(() => { if (state.started && !state.finished) updateStats(); }, 10000);
+
+$("btnStart").onclick = () => {
+  state = { name: $("roundName").value.trim() || "Round " + new Date().toLocaleDateString("en-GB"),
+            started: Date.now(), finished: null, reversing: false, travelling: false, points: [] };
+  save(); redraw(); render(); keepAwake();
+};
+// repeat the last point in the new mode so the new colour starts exactly here
+function modeChanged() {
+  warnUntil = 0;                      // any warning gives way to the new colour
+  const last = state.points[state.points.length - 1];
+  if (last) state.points.push([last[0], last[1], Date.now(), modeNow(), last[4]]);
+  save(); redraw(); render();
+}
+$("btnReverse").onclick = () => {
+  state.reversing = !state.reversing;   // DONE REVERSING returns to collecting or travelling
+  modeChanged();
+  if (navigator.vibrate) navigator.vibrate(state.reversing ? [80, 60, 80] : 80);
+};
+$("btnTravel").onclick = () => {
+  state.travelling = !state.travelling;
+  modeChanged();
+  if (navigator.vibrate) navigator.vibrate(state.travelling ? [150] : 80);
+};
+$("btnFinish").onclick = () => {
+  if (!confirmFinish()) return;
+  state.reversing = false; state.travelling = false; state.finished = Date.now();
+  save(); render();
+  if (wakeLock) wakeLock.release();
+};
+let finishArmed = 0;
+function confirmFinish() {            // tap twice within 3 s, so a stray tap can't end the round
+  if (Date.now() - finishArmed < 3000) return true;
+  finishArmed = Date.now();
+  $("btnFinish").textContent = "TAP AGAIN";
+  setTimeout(() => { $("btnFinish").textContent = "FINISH"; }, 3000);
+  return false;
+}
+$("btnNew").onclick = () => {
+  if ($("btnNew").dataset.armed !== "1") {
+    $("btnNew").dataset.armed = "1"; $("btnNew").textContent = "Tap again to clear";
+    setTimeout(() => { $("btnNew").dataset.armed = ""; $("btnNew").textContent = "New round"; }, 3000);
+    return;
+  }
+  state = { name: "", started: null, finished: null, reversing: false, travelling: false, points: [] };
+  $("roundName").value = ""; save(); redraw(); render();
+};
+
+// ---------------------------------------------------------------------------
+// Export: GPX (standard) and KML (keeps the green/red colours in Google My Maps)
+// ---------------------------------------------------------------------------
+const esc = s => String(s).replace(/[<>&"]/g, c => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", '"': "&quot;" }[c]));
+const iso = t => new Date(t).toISOString();
+const fileBase = () => (state.name || "round").replace(/[^\w\- ]+/g, "").trim().replace(/\s+/g, "_");
+
+function toGpx() {
+  const rs = runs(state.points);
+  let n = 0, out = [`<?xml version="1.0" encoding="UTF-8"?>`,
+    `<gpx version="1.1" creator="Round Recorder" xmlns="http://www.topografix.com/GPX/1/1">`,
+    `<metadata><name>${esc(state.name)}</name><time>${iso(state.started)}</time></metadata>`];
+  rs.forEach(r => { if (r.rev) { n++;
+    const p = r.pts[0];
+    out.push(`<wpt lat="${p[0]}" lon="${p[1]}"><name>Reverse ${n}</name><type>reverse</type></wpt>`); } });
+  const count = [0, 0, 0], names = ["Collecting", "Reverse", "Travel"], types = ["forward", "reverse", "travel"];
+  for (const r of rs) {
+    const label = `${names[r.mode]} ${++count[r.mode]}`;
+    out.push(`<trk><name>${label}</name><type>${types[r.mode]}</type><trkseg>`);
+    for (const p of r.pts) out.push(`<trkpt lat="${p[0]}" lon="${p[1]}"><time>${iso(p[2])}</time></trkpt>`);
+    out.push(`</trkseg></trk>`);
+  }
+  out.push(`</gpx>`);
+  return out.join("\n");
+}
+
+function toKml() {
+  const rs = runs(state.points);
+  const line = (r, i) => `<Placemark><name>${["Collecting", "Reverse", "Travel"][r.mode]} ${i}</name>` +
+    `<styleUrl>#${["fwd", "rev", "trv"][r.mode]}</styleUrl><LineString><tessellate>1</tessellate><coordinates>` +
+    r.pts.map(p => `${p[1]},${p[0]},0`).join(" ") + `</coordinates></LineString></Placemark>`;
+  let f = 0, v = 0, g = 0, t = 0;
+  const fwd = [], rev = [], pins = [], gaps = [], trv = [];
+  rs.forEach((r, i) => { if (r.gapBefore && i) {
+    const a = rs[i - 1].pts[rs[i - 1].pts.length - 1], b = r.pts[0];
+    gaps.push(`<Placemark><name>Not recorded ${++g}</name><styleUrl>#gap</styleUrl><LineString>` +
+              `<coordinates>${a[1]},${a[0]},0 ${b[1]},${b[0]},0</coordinates></LineString></Placemark>`);
+  } });
+  for (const r of rs) {
+    if (r.rev) { v++; rev.push(line(r, v));
+      pins.push(`<Placemark><name>Reverse ${v}</name><styleUrl>#revpin</styleUrl><Point><coordinates>` +
+                `${r.pts[0][1]},${r.pts[0][0]},0</coordinates></Point></Placemark>`); }
+    else if (r.travel) trv.push(line(r, ++t));
+    else fwd.push(line(r, ++f));
+  }
+  const first = state.points[0], last = state.points[state.points.length - 1];
+  const se = first ? `<Placemark><name>Start</name><Point><coordinates>${first[1]},${first[0]},0</coordinates></Point></Placemark>` +
+    `<Placemark><name>Finish</name><Point><coordinates>${last[1]},${last[0]},0</coordinates></Point></Placemark>` : "";
+  // KML colours are aabbggrr
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2"><Document><name>${esc(state.name)}</name>
+<Style id="fwd"><LineStyle><color>ff3c9c1a</color><width>6</width></LineStyle></Style>
+<Style id="rev"><LineStyle><color>ff2b2bd6</color><width>7</width></LineStyle></Style>
+<Style id="revpin"><IconStyle><color>ff2b2bd6</color></IconStyle></Style>
+<Style id="gap"><LineStyle><color>ff807b6b</color><width>4</width></LineStyle></Style>
+<Style id="trv"><LineStyle><color>ffed3a7c</color><width>6</width></LineStyle></Style>
+<Folder><name>Collecting (green)</name>${fwd.join("")}</Folder>
+<Folder><name>Reversing (red)</name>${rev.join("")}${pins.join("")}</Folder>
+${trv.length ? `<Folder><name>Travelling to next area (purple)</name>${trv.join("")}</Folder>` : ""}
+${gaps.length ? `<Folder><name>Not recorded (grey) - route unknown</name>${gaps.join("")}</Folder>` : ""}
+<Folder><name>Start / finish</name>${se}</Folder>
+</Document></kml>`;
+}
+
+function download(name, text, type) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([text], { type }));
+  a.download = name; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+$("btnGpx").onclick = () => download(fileBase() + ".gpx", toGpx(), "application/gpx+xml");
+$("btnKml").onclick = () => download(fileBase() + ".kml", toKml(), "application/vnd.google-earth.kml+xml");
+$("btnShare").onclick = async () => {
+  const files = [new File([toGpx()], fileBase() + ".gpx", { type: "application/gpx+xml" }),
+                 new File([toKml()], fileBase() + ".kml", { type: "application/vnd.google-earth.kml+xml" })];
+  if (navigator.canShare && navigator.canShare({ files })) {
+    try { await navigator.share({ files, title: state.name }); } catch (e) {}
+  } else {
+    $("btnGpx").click(); setTimeout(() => $("btnKml").click(), 400);
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Demo mode (?demo): a fake lorry drives a short loop so you can try the
+// buttons at a desk. It reverses down one side street - tap REVERSE there.
+// ---------------------------------------------------------------------------
+function startDemo() {
+  $("demoTag").hidden = false;
+  // a made-up loop of straight legs: [dLat, dLon] steps from a start point
+  const base = [53.4808, -2.2426];
+  const legs = [[0, 1], [0, 1], [0, 1], [1, 0], [1, 0], [-1, 0], [-1, 0], [0, 1], [0, 1],
+                [-1, 0], [-1, 0], [-1, 0], [0, -1], [0, -1], [0, -1], [0, -1], [0, -1], [1, 0], [1, 0], [1, 0]];
+  const step = 0.00025, pts = [base.slice()];
+  for (const [a, b] of legs) for (let k = 0; k < 6; k++) {
+    const q = pts[pts.length - 1]; pts.push([q[0] + a * step / 6, q[1] + b * step * 1.6 / 6]);
+  }
+  let i = 0;
+  setInterval(() => { const p = pts[i % pts.length]; onFix(p[0], p[1], 6); i++; }, 700);
+}
+
+// ---------------------------------------------------------------------------
+load();
+redraw(); render();
+if (state.points.length > 1) {
+  follow = !state.finished;
+  map.fitBounds(L.latLngBounds(state.points.map(p => [p[0], p[1]])),
+                { padding: [30, 30], maxZoom: 18, animate: false });
+}
+// split screen / rotating the tablet changes the map's size
+window.addEventListener("resize", () => map.invalidateSize());
+startGps();
+if (state.started && !state.finished) keepAwake();
+</script>
+</body>
+</html>
