@@ -1,0 +1,23 @@
+Driver Route Assist
+Copyright (c) 2026 Gary Bennett. All rights reserved.
+
+This software and its source code (including index.html, viewer.html and all
+accompanying files) are the property of Gary Bennett and are protected by
+copyright law.
+
+No licence is granted. You may not copy, modify, distribute, publish, sell,
+sublicense, reverse engineer, or create derivative works from this software,
+in whole or in part, or use it for any commercial purpose, without prior
+written permission from Gary Bennett.
+
+Viewing this code (for example because it is hosted publicly or delivered to
+a web browser) does not grant any right to use or copy it.
+
+Permission requests: contact Gary Bennett.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES OR
+OTHER LIABILITY ARISING FROM THE USE OF THE SOFTWARE.
+
+Third-party components used at run time keep their own licences:
+Leaflet (BSD 2-Clause), map data (c) OpenStreetMap contributors (ODbL).

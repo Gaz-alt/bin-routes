@@ -1,4 +1,10 @@
 <!doctype html>
+<!--
+  Driver Route Assist - Round Viewer
+  Copyright (c) 2026 Gary Bennett. All rights reserved.
+  Not for use, copying, modification or distribution without written permission
+  from Gary Bennett. See LICENSE.
+-->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -68,7 +74,9 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script>
 "use strict";
+// Driver Route Assist - Copyright (c) 2026 Gary Bennett. All rights reserved.
 const map = L.map("map").setView([54.5, -2.5], 6);
+map.attributionControl.setPrefix("© 2026 Gary Bennett · Driver Route Assist");
 L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
   maxZoom: 19, attribution: "&copy; OpenStreetMap contributors"
 }).addTo(map);
